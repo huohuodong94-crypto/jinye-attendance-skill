@@ -655,8 +655,9 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
     should_days = 0
     work_hours = 0.0
     leave_hours = 0.0
-    travel_days = 0
-    outside_days = 0
+    travel_days = 0  # 全天出差
+    outside_days = 0  # 全天外出
+    partial_outside_info = []  # 部分外出信息列表：[(日期, 小时数)]
     late_count = 0
     early_count = 0
     leave_days = 0
@@ -717,7 +718,10 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
             if "出差" in status:
                 travel_days += 1
             if "外出" in status:
-                outside_days += 1
+                if status == "外出":
+                    outside_days += 1  # 只统计全天外出
+                elif status == "部分外出":
+                    partial_outside_info.append((day, entry.get("outside_hours", 0)))
         else:
             # 正常日：算满勤（迟到早退缺卡不扣）
             work_hours += STD_DAY_HOURS
@@ -757,6 +761,9 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
         abnormal_parts.append(f"出差{travel_days}天")
     if outside_days > 0:
         abnormal_parts.append(f"外出{outside_days}天")
+    if partial_outside_info:
+        for day, hours in partial_outside_info:
+            abnormal_parts.append(f"部分外出{hours}小时（{day}）")
     # 规则8.9：补卡不再出现在异常说明中
 
     return {
