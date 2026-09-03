@@ -763,7 +763,7 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
         abnormal_parts.append(f"外出{outside_days}天")
     if partial_outside_info:
         for day, hours in partial_outside_info:
-            abnormal_parts.append(f"部分外出{hours}小时（{day}）")
+            abnormal_parts.append(f"部分外出{hours}小时（{month}.{day}）")
     # 规则8.9：补卡不再出现在异常说明中
 
     return {
