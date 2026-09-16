@@ -477,57 +477,6 @@ def calc_daily_leave_hours(desc_marker, day, month):
     return round(total_minutes / 60, 1)
 
 
-def fmt_minutes(m):
-    """分钟数 → 'HH:MM'"""
-    return f"{m // 60:02d}:{m % 60:02d}"
-
-
-def calc_daily_leave_range(desc_marker, day, month):
-    """
-    按天拆分请假时段：返回当天请假起止时间 'HH:MM-HH:MM'（以请假表申请时间为准）。
-    - 同一天：申请原始起止（如 14:00-18:00）
-    - 起始日：申请开始时间 → 当天下班
-    - 结束日：当天上班 → 申请结束时间
-    - 中间日：全天工作时间段
-    描述中无起止时间时返回 None。
-    """
-    m = re.search(r"(\d{2})-(\d{2}) (\d{1,2}):(\d{2})到(\d{2})-(\d{2}) (\d{1,2}):(\d{2})", desc_marker)
-    if not m:
-        return None
-
-    start_m, start_d = int(m.group(1)), int(m.group(2))
-    end_m, end_d = int(m.group(5)), int(m.group(6))
-    start_h, start_min = int(m.group(3)), int(m.group(4))
-    end_h, end_min = int(m.group(7)), int(m.group(8))
-
-    pm_start, pm_end, std_hours = get_work_hours(month)
-    am_start = WORK_START_AM  # 08:30
-
-    today = (month, day)
-    start_date = (start_m, start_d)
-    end_date = (end_m, end_d)
-
-    if start_date == today and end_date == today:
-        ls, le = start_h * 60 + start_min, end_h * 60 + end_min
-    elif start_date == today:
-        ls, le = start_h * 60 + start_min, pm_end
-    elif end_date == today:
-        ls, le = am_start, end_h * 60 + end_min
-    else:
-        ls, le = am_start, pm_end
-    return f"{fmt_minutes(ls)}-{fmt_minutes(le)}"
-
-
-def write_leave_overtime_cell(ws, row, col, leave_type, day_hours, time_range):
-    """加班列请假标注：'事假4.0小时' 换行 '14:00-18:00'，整格红色"""
-    marker = f"{leave_type}{day_hours}小时"
-    if time_range:
-        marker += f"\n{time_range}"
-    cell = safe_write_cell(ws, row, col, marker, font=Font(color=COLOR_RED))
-    cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
-    return cell
-
-
 # ==================== 考勤计算 ====================
 
 def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
@@ -652,9 +601,8 @@ def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
         period = extract_period(lm, day, month)
         hours = float(hm.group(1)) if hm else (7.5 if period == "全天" else 4.0)
 
-        # 规则8.8 + 按天拆分：当天实际请假小时数（与工作时间段的交集）及当天起止时间段
-        has_range = bool(re.search(r"\d{2}-\d{2} \d{1,2}:\d{2}到", lm))
-        if period != "全天" or has_range:
+        # 规则8.8：部分请假计算当天实际请假小时数（与工作时间段的交集）
+        if period != "全天":
             hours = calc_daily_leave_hours(lm, day, month)
 
         # 请假类型（优先从请假表取，其次从描述判断）
@@ -664,8 +612,6 @@ def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
 
         entry["leave_type"] = leave_type
         entry["leave_hours"] = hours
-        entry["leave_day_hours"] = hours  # 当天口径时长（按天拆分展示用）
-        entry["leave_range"] = calc_daily_leave_range(lm, day, month) if has_range else None
         entry["leave_total_hours"] = float(hm.group(1)) if hm else (7.5 if period == "全天" else 4.0)  # 整段总时长
         entry["leave_desc"] = lm  # 请假标记，用于段首判断（如"事假08-03 13:57到08-05 18:00 19小时"）
         if period == "全天":
@@ -673,7 +619,7 @@ def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
         else:
             entry["status"] = "部分请假"
             entry["leave_period"] = period
-            entry["marker"] = f"{leave_type}{hours}小时"
+            entry["marker"] = f"事假{hours}小时"
         return entry
 
     # 休息（出差/外出期间的休息日不算）
@@ -883,73 +829,8 @@ def generate_output(template_path, output_path, employees, year, month, order_li
         if office_name in wb.sheetnames:
             generate_detail_sheet(wb[office_name], employees, emp_list, year, month)
 
-    # 自适应：明细表列宽按内容最长行扩展（只增不减），多行内容行高同步加高
-    for sn in wb.sheetnames:
-        if sn.endswith("办公室"):
-            autofit_detail_sheet(wb[sn])
-
     wb.save(output_path)
     return output_path
-
-
-def autofit_detail_sheet(ws):
-    """根据单元格内容自适应列宽/行高：
-    - 列宽：按该列非合并单元格的最长一行内容估算（中文=2单位），只增不减，上限40
-    - 行高：含换行的单元格按行数加高（每行15），只增不减
-    跨列合并单元格不参与列宽计算（其内容横跨多列，不代表单列需求）。
-    """
-    from openpyxl.utils import get_column_letter
-
-    def line_width(text):
-        return sum(2 if ord(ch) > 127 else 1 for ch in text)
-
-    def cell_width(v):
-        if v is None:
-            return 0
-        return max((line_width(l) for l in str(v).split("\n")), default=0)
-
-    # 收集跨列合并区内的单元格坐标
-    merged_multi_col = set()
-    for mr in ws.merged_cells.ranges:
-        if mr.max_col > mr.min_col:
-            for r in range(mr.min_row, mr.max_row + 1):
-                for c in range(mr.min_col, mr.max_col + 1):
-                    merged_multi_col.add((r, c))
-
-    col_need = {}
-    row_lines = {}
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.value is None:
-                continue
-            if (cell.row, cell.column) in merged_multi_col:
-                continue
-            wrapped = bool(cell.alignment and cell.alignment.wrap_text)
-            if not wrapped:
-                # 未换行的文本可溢出显示，仅当右侧单元格被占位遮挡时才计入列宽
-                nxt = ws.cell(row=cell.row, column=cell.column + 1).value
-                if nxt is None or str(nxt).strip() == "":
-                    continue
-            w = cell_width(cell.value)
-            if w > col_need.get(cell.column, 0):
-                col_need[cell.column] = w
-            lines = str(cell.value).count("\n") + 1
-            if wrapped and lines > row_lines.get(cell.row, 1):
-                row_lines[cell.row] = lines
-
-    for col, w in col_need.items():
-        letter = get_column_letter(col)
-        cur = ws.column_dimensions[letter].width or 0
-        need = min(w + 2, 40)
-        if need > cur:
-            ws.column_dimensions[letter].width = need
-
-    for r, lines in row_lines.items():
-        if lines > 1:
-            cur = ws.row_dimensions[r].height or 0
-            need = 15 * lines
-            if need > cur:
-                ws.row_dimensions[r].height = need
 
 
 def generate_summary_sheet(ws, employees, order_list, year, month):
@@ -1184,10 +1065,11 @@ def fill_daily_row(ws, row, col_start, day, entry, year, month, is_leave_start=F
         lt = entry["leave_type"] or "事假"
         for c in range(4):
             safe_write_cell(ws, row, col_start + 2 + c, lt, font=Font(color=COLOR_PURPLE))
-        # 按天标注：每天显示当天请假时长 + 请假表起止时间段（换行两行，红色）
-        day_h = entry.get("leave_day_hours", entry.get("leave_hours"))
-        if day_h:
-            write_leave_overtime_cell(ws, row, col_start + 6, lt, day_h, entry.get("leave_range"))
+        # 规则8.7：段首标注整段请假总时长
+        if is_leave_start and entry.get("leave_total_hours"):
+            total_hours = entry["leave_total_hours"]
+            marker = f"事假{total_hours}小时"
+            safe_write_cell(ws, row, col_start + 6, marker, font=Font(color=COLOR_RED))
         return
 
     # 规则8.6：出差/外出日打卡时间必须为黑色
@@ -1251,10 +1133,12 @@ def fill_daily_row(ws, row, col_start, day, entry, year, month, is_leave_start=F
                 safe_write_cell(ws, row, col_start + 5, punches[3])
             else:
                 safe_write_cell(ws, row, col_start + 5, lt, font=Font(color=COLOR_PURPLE))
-        # 按天标注：当天请假时长 + 起止时间段（换行两行，红色）
-        day_h = entry.get("leave_day_hours", entry.get("leave_hours"))
-        if day_h:
-            write_leave_overtime_cell(ws, row, col_start + 6, lt, day_h, entry.get("leave_range"))
+        # 规则8.7：段首标注整段请假总时长，否则标注当天实际小时数
+        if is_leave_start and entry.get("leave_total_hours"):
+            total_hours = entry["leave_total_hours"]
+            safe_write_cell(ws, row, col_start + 6, f"事假{total_hours}小时", font=Font(color=COLOR_RED))
+        elif entry.get("marker"):
+            safe_write_cell(ws, row, col_start + 6, entry["marker"])
         return
 
     # 半天出差/外出：
