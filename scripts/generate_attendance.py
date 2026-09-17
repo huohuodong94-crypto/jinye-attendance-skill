@@ -23,12 +23,14 @@
 
 import argparse
 import re
+import math
 import calendar
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import openpyxl
 from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
 
 
 # ==================== 常量配置 ====================
@@ -477,6 +479,47 @@ def calc_daily_leave_hours(desc_marker, day, month):
     return round(total_minutes / 60, 1)
 
 
+def fmt_minutes(m):
+    """分钟数 → 'HH:MM'"""
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def calc_daily_leave_range(desc_marker, day, month):
+    """
+    按天拆分请假时段：返回当天请假起止时间 'HH:MM-HH:MM'（以请假表申请时间为准）。
+    - 同一天：申请原始起止（如 14:00-18:00）
+    - 起始日：申请开始时间 → 当天下班
+    - 结束日：当天上班 → 申请结束时间
+    - 中间日：全天工作时间段
+    描述中无起止时间时返回 None。仅用于异常说明括注，不影响工时计算。
+    """
+    m = re.search(r"(\d{2})-(\d{2}) (\d{1,2}):(\d{2})到(\d{2})-(\d{2}) (\d{1,2}):(\d{2})", desc_marker)
+    if not m:
+        return None
+
+    start_m, start_d = int(m.group(1)), int(m.group(2))
+    end_m, end_d = int(m.group(5)), int(m.group(6))
+    start_h, start_min = int(m.group(3)), int(m.group(4))
+    end_h, end_min = int(m.group(7)), int(m.group(8))
+
+    pm_start, pm_end, std_hours = get_work_hours(month)
+    am_start = WORK_START_AM  # 08:30
+
+    today = (month, day)
+    start_date = (start_m, start_d)
+    end_date = (end_m, end_d)
+
+    if start_date == today and end_date == today:
+        ls, le = start_h * 60 + start_min, end_h * 60 + end_min
+    elif start_date == today:
+        ls, le = start_h * 60 + start_min, pm_end
+    elif end_date == today:
+        ls, le = am_start, end_h * 60 + end_min
+    else:
+        ls, le = am_start, pm_end
+    return f"{fmt_minutes(ls)}-{fmt_minutes(le)}"
+
+
 # ==================== 考勤计算 ====================
 
 def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
@@ -612,6 +655,7 @@ def build_daily_entry(desc, times, emp_name, day, leave_map, year, month):
 
         entry["leave_type"] = leave_type
         entry["leave_hours"] = hours
+        entry["leave_range"] = calc_daily_leave_range(lm, day, month)  # 当天申请时段，仅用于异常说明括注
         entry["leave_total_hours"] = float(hm.group(1)) if hm else (7.5 if period == "全天" else 4.0)  # 整段总时长
         entry["leave_desc"] = lm  # 请假标记，用于段首判断（如"事假08-03 13:57到08-05 18:00 19小时"）
         if period == "全天":
@@ -655,6 +699,7 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
     should_days = 0
     work_hours = 0.0
     leave_hours = 0.0
+    leave_details = []  # [(day, 请假类型, 当天时段)]，用于异常说明括注
     travel_days = 0  # 全天出差
     outside_days = 0  # 全天外出
     partial_outside_info = []  # 部分外出信息列表：[(日期, 小时数)]
@@ -706,6 +751,7 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
                 leave_hours += STD_DAY_HOURS
                 leave_days += 1
                 leave_types.add(entry["leave_type"] or "事假")
+                leave_details.append((day, entry["leave_type"] or "事假", entry.get("leave_range")))
                 if entry["leave_type"] == "病假":
                     sick_days += 1
         elif status == "部分请假":
@@ -713,6 +759,7 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
             work_hours += STD_DAY_HOURS - entry["leave_hours"]
             leave_hours += entry["leave_hours"]
             leave_types.add(entry["leave_type"] or "事假")
+            leave_details.append((day, entry["leave_type"] or "事假", entry.get("leave_range")))
         elif status in ("出差", "部分出差", "外出", "部分外出"):
             work_hours += STD_DAY_HOURS
             if "出差" in status:
@@ -756,7 +803,23 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
     if leave_hours > 0:
         # 请假类型：单一类型用该类型，混合用"请假"
         lt = leave_types.pop() if len(leave_types) == 1 else "请假"
-        abnormal_parts.append(format_leave_time(leave_hours, lt))
+        leave_item = format_leave_time(leave_hours, lt)
+        # 新规则(2026-09-16客户确认)：仅明细表异常说明括注每天请假明细与时间段，一览表备注保持汇总口径
+        paren = ""
+        if leave_details:
+            leave_details.sort(key=lambda x: x[0])
+            single_type = len({t for _, t, _ in leave_details}) == 1
+            frags = []
+            for d, t, rng in leave_details:
+                head = f"{month}.{d}" if single_type else f"{t}{month}.{d}"
+                frags.append(f"{head} {rng}" if rng else head)
+            paren = "（" + "；".join(frags) + "）"
+        leave_item_idx = len(abnormal_parts)
+        abnormal_parts.append(leave_item)
+        if paren:
+            _detail_paren = (leave_item_idx, paren)
+        else:
+            _detail_paren = None
     if travel_days > 0:
         abnormal_parts.append(f"出差{travel_days}天")
     if outside_days > 0:
@@ -766,10 +829,24 @@ def compute_attendance(emp_name, daily, year, month, miss_in_total, miss_out_tot
             abnormal_parts.append(f"部分外出{hours}小时（{month}.{day}）")
     # 规则8.9：补卡不再出现在异常说明中
 
+    # 明细表版：在请假项后括注每日请假明细（一览表不用）
+    try:
+        _detail_paren
+    except NameError:
+        _detail_paren = None
+    if _detail_paren:
+        idx, paren = _detail_paren
+        detail_parts = list(abnormal_parts)
+        detail_parts[idx] = detail_parts[idx] + paren
+        abnormal_detail_str = "，".join(detail_parts)
+    else:
+        abnormal_detail_str = "，".join(abnormal_parts) if abnormal_parts else ""
+
     return {
         "should_days": should_days,
         "actual_str": actual_str,
         "abnormal_summary": "，".join(abnormal_parts) if abnormal_parts else "",
+        "abnormal_detail": abnormal_detail_str,
         "work_hours": work_hours,
         "leave_hours": leave_hours,
         "miss_count": miss_count,
@@ -1024,10 +1101,23 @@ def generate_detail_sheet(ws, employees, emp_list, year, month):
         safe_write_cell(ws, start_row + 22, 13, "员工签字：")
 
         # 考勤异常说明（无论是否有异常，都强制覆盖，防止模板残留数据）
-        if summary.get("abnormal_summary"):
-            safe_write_cell(ws, start_row + 23, 1, f"考勤异常说明：{summary['abnormal_summary']}")
-        else:
-            safe_write_cell(ws, start_row + 23, 1, "")  # 清空单元格
+        # 2026-09-16新规则：合并整行(1-16列)+自动换行，行高按内容自适应，确保请假明细完整显示
+        ab_row = start_row + 23
+        ab_text = f"考勤异常说明：{summary.get('abnormal_detail') or summary['abnormal_summary']}" if summary.get("abnormal_summary") else ""
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row <= ab_row <= mr.max_row:
+                ws.unmerge_cells(str(mr))
+        if ab_text:
+            ws.merge_cells(start_row=ab_row, start_column=1, end_row=ab_row, end_column=16)
+        ab_cell = safe_write_cell(ws, ab_row, 1, ab_text)
+        ab_cell.alignment = Alignment(wrap_text=True, vertical="center", horizontal="left")
+        # 行高：按16列总宽估算所需行数（中文=2单位），只增不减
+        width_units = sum((ws.column_dimensions[get_column_letter(c)].width or 9) for c in range(1, 17))
+        text_w = sum(2 if ord(ch) > 127 else 1 for ch in ab_text)
+        lines = max(1, math.ceil(text_w / max(width_units - 2, 10))) if ab_text else 1
+        ab_need = 15 * lines
+        if ab_need > (ws.row_dimensions[ab_row].height or 0):
+            ws.row_dimensions[ab_row].height = ab_need
 
 
 def fill_daily_row(ws, row, col_start, day, entry, year, month, is_leave_start=False):
