@@ -25,6 +25,7 @@ import argparse
 import re
 import math
 import calendar
+from copy import copy
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -60,13 +61,11 @@ COLOR_GREEN = "FF00B050"
 COLOR_ORANGE = "FFFFA500"      # 外出（橙色）
 COLOR_PURPLE = "FF7030A0"
 
-# 明细打卡块员工（按办公室）
-OFFICE_EMPLOYEES = {
-    "公庄办公室": ["邱惠浓", "谢铃铃", "钟慧婷", "王文敏", "李健容", "张小萍"],
-    "陈江办公室": [
-        "罗玉珍", "崔怡", "彭宏", "孙誉婕", "许凡", "翟海浩",
-        "李岭恩（离职）", "杨建", "郁魏", "刘致君", "马杨萍", "余唯",
-    ],
+# 考勤组 → 办公室映射（2026-10-08 客户确认：员工名单不再写死，人员动态维护）
+# 未命中映射的考勤组，一览表"所属办公室"显示考勤组原名
+GROUP_OFFICE_MAP = {
+    "公庄办公室": "公庄办公室",
+    "广东锦业体育设施有限公司": "陈江办公室",
 }
 
 # 计时工（按总工时计薪，不按天考核）：{姓名: 总工时小时数}
@@ -898,6 +897,8 @@ def generate_output(template_path, output_path, employees, year, month, order_li
             continue
         if name not in employees:
             continue
+        if not employees[name].get("daily"):
+            continue  # 2026-10-08：无逐日考勤数据（未加入考勤组等）不进明细
         if office not in office_emps:
             office_emps[office] = []
         office_emps[office].append(name)
@@ -911,13 +912,18 @@ def generate_output(template_path, output_path, employees, year, month, order_li
 
 
 def generate_summary_sheet(ws, employees, order_list, year, month):
-    """生成考勤一览表"""
-    # 清除模板原数据
-    for r in range(4, 40):
+    """生成考勤一览表（2026-10-08 起动态行数：全员套用模板行样式，列宽/行高自适应，制表人动态定位）"""
+    # 捕获模板数据行样式（第4行逐列），所有数据行统一套用，新员工行不再无边框裸奔
+    col_styles = {c: copy(ws.cell(4, c)._style) for c in range(1, 9)}
+
+    # 清除模板原数据（按人数扩展清除范围，含旧"制表"行）
+    clear_to = max(40, 12 + len(order_list))
+    for r in range(4, clear_to):
         for c in range(1, 9):
             cell = ws.cell(r, c)
             if not isinstance(cell, openpyxl.cell.cell.MergedCell):
                 cell.value = None
+                cell.font = Font(color="FF000000")  # 规则2：清除后重置字体默认
 
     row = 4
     for seq, name, department, office in order_list:
@@ -958,10 +964,39 @@ def generate_summary_sheet(ws, employees, order_list, year, month):
             ws.cell(row, 6).value = summary.get("actual_str", "27")
             ws.cell(row, 7).value = summary.get("abnormal_summary", "")
         ws.cell(row, 8).value = ""  # 签名
+
+        # 统一套用模板行样式（边框/居中/字体随模板）
+        for c in range(1, 9):
+            ws.cell(row, c)._style = copy(col_styles[c])
+        if ws.cell(row, 7).value:
+            ws.cell(row, 7).alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
         row += 1
 
-    # 制表人
-    ws.cell(30, 5).value = "制表：余唯"
+    # 列宽按内容自适应（规则：单元格按内容自适应宽高，封顶防失控）
+    def disp_w(s):
+        return sum(2 if ord(ch) > 127 else 1 for ch in str(s))
+    dept_vals = [d for (_, _, d, _) in order_list if d]
+    dept_w = max([disp_w(d) for d in dept_vals] + [10])
+    cur_b = ws.column_dimensions["B"].width or 12
+    ws.column_dimensions["B"].width = min(max(cur_b, dept_w + 2), 30)
+    note_cells = [ws.cell(r, 7).value for r in range(4, row) if ws.cell(r, 7).value]
+    note_w = max([disp_w(v) for v in note_cells] + [10])
+    cur_g = ws.column_dimensions["G"].width or 20
+    ws.column_dimensions["G"].width = min(max(cur_g, note_w + 2), 46)
+    # 行高按部门/备注换行数自适应（只增不减）
+    b_w = ws.column_dimensions["B"].width
+    g_w = ws.column_dimensions["G"].width
+    for r in range(4, row):
+        lines = 1
+        for v, w in ((ws.cell(r, 2).value, b_w), (ws.cell(r, 7).value, g_w)):
+            if v:
+                lines = max(lines, math.ceil(disp_w(v) / max(w - 2, 10)))
+        need = 15 * lines
+        if need > (ws.row_dimensions[r].height or 15):
+            ws.row_dimensions[r].height = need
+
+    # 制表人：动态定位在最后一个数据行的下一行（不再写死第30行）
+    ws.cell(row, 5).value = "制表：余唯"
 
 
 def find_employee_blocks(ws):
@@ -980,18 +1015,68 @@ def find_employee_blocks(ws):
     return blocks
 
 
+def clone_employee_block(ws, src_start, height=26):
+    """克隆员工明细块到表尾：复制样式/值/行高/合并单元格，返回新块起始行。
+    数据区随后会被写入逻辑清除，克隆模板块结构不会产生人员数据残留。"""
+    dst_start = ws.max_row + 1
+    for i in range(height):
+        sr, dr = src_start + i, dst_start + i
+        h = ws.row_dimensions[sr].height
+        if h:
+            ws.row_dimensions[dr].height = h
+        for c in range(1, 17):
+            src_cell = ws.cell(sr, c)
+            if isinstance(src_cell, openpyxl.cell.cell.MergedCell):
+                continue
+            dst_cell = ws.cell(dr, c)
+            dst_cell._style = copy(src_cell._style)
+            dst_cell.value = src_cell.value
+    offset = dst_start - src_start
+    for mr in list(ws.merged_cells.ranges):
+        if src_start <= mr.min_row and mr.max_row <= src_start + height - 1:
+            ws.merge_cells(start_row=mr.min_row + offset, start_column=mr.min_col,
+                           end_row=mr.max_row + offset, end_column=mr.max_col)
+    return dst_start
+
+
 def generate_detail_sheet(ws, employees, emp_list, year, month):
-    """生成办公室明细，每个员工26行块（按员工顺序分配模板块）"""
+    """生成办公室明细，每个员工26行块。
+    2026-10-08 起：块按姓名匹配复用；离职/移除人员的释放块优先给新员工；
+    块不足时克隆末块追加，新员工不再被丢弃；无人认领块整块清空防残留。"""
     all_blocks = find_employee_blocks(ws)
-    # 按员工顺序分配块：第i个员工用第i个模板块
-    for i, name in enumerate(emp_list):
+    block_height = 26
+    name_to_block = {}
+    for nm, r in all_blocks:
+        name_to_block.setdefault(nm.replace("（离职）", "").strip(), r)
+    assignments, used_rows = {}, set()
+    for name in emp_list:
+        r = name_to_block.get(name)
+        if r is not None and r not in used_rows:
+            assignments[name] = r
+            used_rows.add(r)
+    free_blocks = [r for _, r in all_blocks if r not in used_rows]
+    for name in emp_list:
+        if name in assignments:
+            continue
+        if free_blocks:
+            assignments[name] = free_blocks.pop(0)
+        else:
+            src = max(used_rows) if used_rows else all_blocks[0][1]
+            assignments[name] = clone_employee_block(ws, src, block_height)
+        used_rows.add(assignments[name])
+    # 无人认领的释放块整块清空，防止模板残留
+    for r in free_blocks:
+        for rr in range(r, r + block_height):
+            for c in range(1, 17):
+                cell = ws.cell(rr, c)
+                if not isinstance(cell, openpyxl.cell.cell.MergedCell):
+                    cell.value = None
+
+    for name in emp_list:
         if name not in employees:
             continue
-        if i >= len(all_blocks):
-            # 员工数超过模板块数，跳过（需复制块，暂不处理）
-            continue
         emp = employees[name]
-        start_row = all_blocks[i][1]  # 按顺序取块
+        start_row = assignments[name]
 
         # 规则8.11：清除数据区前取消所有合并单元格
         for mr in list(ws.merged_cells.ranges):
@@ -1048,7 +1133,7 @@ def generate_detail_sheet(ws, employees, emp_list, year, month):
             right_day = i + 17
 
             if left_day <= days_in_month(year, month):
-                entry = emp["daily"].get(left_day)
+                entry = fill_rest_if_none(emp["daily"].get(left_day), left_day, name, year, month)
                 # 判断是否为请假段首
                 is_leave_start = False
                 if entry and entry.get("status") in ("请假", "部分请假"):
@@ -1072,7 +1157,7 @@ def generate_detail_sheet(ws, employees, emp_list, year, month):
                 fill_daily_row(ws, data_row, 1, left_day, entry, year, month, is_leave_start)
             
             if right_day <= days_in_month(year, month):
-                entry = emp["daily"].get(right_day)
+                entry = fill_rest_if_none(emp["daily"].get(right_day), right_day, name, year, month)
                 # 判断是否为请假段首
                 is_leave_start = False
                 if entry and entry.get("status") in ("请假", "部分请假"):
@@ -1118,6 +1203,18 @@ def generate_detail_sheet(ws, employees, emp_list, year, month):
         ab_need = 15 * lines
         if ab_need > (ws.row_dimensions[ab_row].height or 0):
             ws.row_dimensions[ab_row].height = ab_need
+
+
+def fill_rest_if_none(entry, day, emp_name, year, month):
+    """2026-10-08规则：应休息日源数据无值时，明细4格补"休息"（与模板惯例一致）；离职日后不补"""
+    if entry is not None:
+        return entry
+    if not is_rest_day(year, month, day):
+        return entry
+    lc = LEAVE_COMPANY_DATE.get(emp_name)
+    if lc and day > lc:
+        return entry
+    return {"status": "休息", "punches": [None, None, None, None]}
 
 
 def fill_daily_row(ws, row, col_start, day, entry, year, month, is_leave_start=False):
@@ -1377,7 +1474,7 @@ def build_order_list(template_path, summary_data, employees):
     2. 用模板的部门/办公室信息补充（模板中有该员工时）
     3. 模板中没有的新员工，从月度汇总读取部门/办公室
     4. 不在月度汇总中的模板员工，仅保留已知特殊人员（非打卡/居家办公/整月出差/计时工），离职人员移除
-    5. 排序：公庄办公室在前，陈江办公室在后（按模板顺序），新员工追加
+    5. 新员工按"同办公室+同部门→同办公室末尾→表尾"插入，与模板人员维护在一起（2026-10-08 规则）
     返回 [(序号, 姓名, 部门, 办公室)]
     """
     # 从模板读取原有顺序和部门/办公室
@@ -1418,17 +1515,39 @@ def build_order_list(template_path, summary_data, employees):
             final_order.append((name, department, office))
             seen.add(name)
 
-    # 2. 月度汇总中的新员工（模板中没有的）
-    for name in summary_names:
+    # 2. 月度汇总中的新员工（模板中没有的）——2026-10-08 客户确认规则：
+    #    a) 办公室按考勤组映射（GROUP_OFFICE_MAP），未命中显示考勤组原名，不再默认陈江；
+    #    b) 无逐日考勤数据且非特殊人员的新员工不进一览表（方案2）；
+    #    c) 插入位置：同办公室+同一级部门的老员工之后 → 同办公室末尾 → 表尾
+    def _dept_prefix(d):
+        return str(d or "").split("-")[0].strip()
+    for name, data in summary_data.items():
         if name in seen:
             continue
-        # 从月度汇总读取部门/办公室
-        info = summary_data[name].get("info", {})
+        info = data.get("info", {})
         department = info.get("department", "")
-        # 办公室从考勤组推断（考勤组含"公庄"→公庄办公室，否则→陈江办公室）
         group = info.get("group", "")
-        office = "公庄办公室" if "公庄" in group else "陈江办公室"
-        final_order.append((name, department, office))
+        office = GROUP_OFFICE_MAP.get(group, group)
+        # 方案2：按"实出勤天/小时>0"判定新员工的实际考勤；当月无实际出勤的新人（产线未考核/未入职等）不进一览表
+        act = str(employees.get(name, {}).get("summary", {}).get("actual_str", "0"))
+        m_days = re.match(r"(\d+)", act)
+        m_hours = re.search(r"([\d.]+)小时", act)
+        has_actual = (int(m_days.group(1)) if m_days else 0) > 0 or (float(m_hours.group(1)) if m_hours else 0) > 0
+        if not has_actual and name not in special_keep:
+            continue
+        idx = None
+        if department:
+            for i, (n2, d2, o2) in enumerate(final_order):
+                if o2 == office and _dept_prefix(d2) == _dept_prefix(department):
+                    idx = i + 1
+        if idx is None and office:
+            for i, (n2, d2, o2) in enumerate(final_order):
+                if o2 == office:
+                    idx = i + 1
+        if idx is None:
+            final_order.append((name, department, office))
+        else:
+            final_order.insert(idx, (name, department, office))
         seen.add(name)
 
     # 3. 特殊保留人员（不在月度汇总也不在模板）
